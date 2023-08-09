@@ -8,18 +8,78 @@ from typing import *
 
 import bs4
 import requests
+from requests.structures import CaseInsensitiveDict
 import urllib3.util
-from urllib3.util import Url
+
+
+@dataclasses.dataclass(frozen=True, order=True)
+class Uri:
+    """Identifier for a resource, encoded as host and path."""
+    host: str
+    path: str
+
+
+@dataclasses.dataclass(frozen=True, order=True)
+class Url:
+    """Normalized variant of urllib3 Url."""
+    scheme: str
+    uri: Uri
+    query: Optional[str]
+    fragment: Optional[str]
+
+    @classmethod
+    def normalize(cls, url: urllib3.util.Url) -> 'Url':
+        """Establish desirable invariants about the URL contents."""
+        assert url.host is not None
+        return cls(
+            scheme=url.scheme or 'http',
+            uri=Uri(host=url.host, path=url.path or '/'),
+            query=url.query,
+            fragment=url.fragment)
+
+    @classmethod
+    def parse(cls, s: str) -> 'Url':
+        return cls.normalize(urllib3.util.parse_url(s))
+
+    @property
+    def url(self) -> urllib3.util.Url:
+        return urllib3.util.Url(
+            scheme=self.scheme,
+            host=self.uri.host,
+            path=self.uri.path,
+            query=self.query,
+            fragment=self.fragment)
+    
+    def __str__(self) -> str:
+        return str(self.url)
+
+    def relative(self, rel: str) -> 'Url':
+        """Resolve a relative URL."""
+        rhs = urllib3.util.parse_url(rel)
+        if not rhs.path:
+            path = self.uri.path
+        elif rhs.path.startswith('/'):
+            path = rhs.path
+        else:
+            dirname = os.path.dirname(self.uri.path)
+            path = os.path.join(dirname, rhs.path)
+        return Url(
+            scheme=rhs.scheme or self.scheme,
+            uri=Uri(host=rhs.host or self.uri.host, path=path),
+            query=rhs.query,
+            fragment=rhs.fragment)
 
 
 @dataclasses.dataclass
 class Resource:
+    """Cached resource resulting from an HTTP GET."""
     status: int
-    headers: Dict[str, str]
+    headers: CaseInsensitiveDict[str]
     data: bytes
 
 
 def resource_extension(resource: Resource) -> Optional[str]:
+    """Deduce the appropriate file extension based on Content-Type."""
     for content_type in split_list(resource.headers['Content-Type'], ';'):
         ext = mimetypes.guess_extension(content_type)
         if ext is not None:
@@ -29,9 +89,11 @@ def resource_extension(resource: Resource) -> Optional[str]:
 
 @dataclasses.dataclass
 class Database:
+    """SQLite store for Resources."""
     path: str
 
     def create(self, *, recreate: bool = False):
+        """Initialize the database tables."""
         if os.path.exists(self.path):
             if recreate:
                 os.unlink(self.path)
@@ -56,14 +118,15 @@ class Database:
                 );
             """)
 
-    def get(self, url: Url) -> Optional[Resource]:
+    def get(self, uri: Uri) -> Optional[Resource]:
+        """Look up a resource by URI."""
         with sqlite3.connect(self.path) as connection:
             connection.row_factory = sqlite3.Row
             c = connection.cursor()
             c.execute("""
                 SELECT id, status, data FROM url
                 WHERE host = ? AND path = ?
-            """, (url.host, url.path))
+            """, (uri.host, uri.path))
             url_row = c.fetchone()
             if url_row is None:
                 return None
@@ -74,16 +137,19 @@ class Database:
             header_rows = c.fetchall()
         return Resource(
             status=url_row['status'],
-            headers={r['name']: r['value'] for r in header_rows},
+            headers=CaseInsensitiveDict(
+                {r['name']: r['value'] for r in header_rows}),
             data=url_row['data'])
 
     def insert(self, url: Url, resource: Resource):
+        """Insert a resource into the store."""
         with sqlite3.connect(self.path) as connection:
             c = connection.cursor()
             c.execute("""
                 INSERT INTO url(host, path, status, data)
                 VALUES(?, ?, ?, ?)
-            """, (url.host, url.path, resource.status, resource.data))
+            """, (url.uri.host, url.uri.path, resource.status,
+                  resource.data))
             url_id = c.lastrowid
             for name, value in resource.headers.items():
                 c.execute("""
@@ -91,39 +157,50 @@ class Database:
                     VALUES(?, ?, ?)
                 """, (url_id, name, value))
 
-    def keys(self) -> List[Url]:
+    def keys(self) -> List[Uri]:
+        """List stored resources (Uri only)."""
         with sqlite3.connect(self.path) as connection:
             connection.row_factory = sqlite3.Row
             c = connection.cursor()
             c.execute('SELECT host, path FROM url')
-            return [normalize_url(Url(host=r['host'], path=r['path']))
-                    for r in c.fetchall()]
+            return [Uri(host=r['host'], path=r['path']) for r in c.fetchall()]
+
+    def items(self) -> Iterator[Tuple[Uri, Resource]]:
+        """List stored resources (Uri and Resource)."""
+        for uri in self.keys():
+            resource = self.get(uri)
+            assert resource is not None
+            yield uri, resource
 
 
 @dataclasses.dataclass
 class HTTPCache:
+    """HTTP fetch API backed by a Database."""
     database: Database
 
     def fetch(self, url: Url) -> Resource:
-        hit = self.database.get(url)
+        """Return a cached resource if available, or perform a GET."""
+        hit = self.database.get(url.uri)
         if hit is not None:
             return hit
-        response = self.fetch_uncached(url)
-        resource = Resource(
-            status=response.status_code,
-            headers=response.headers,
-            data=response.content)
+        resource = self.fetch_uncached(url)
         self.database.insert(url, resource)
         return resource
 
     def fetch_uncached(self, url: Url) -> Resource:
+        """Unconditionally perform a GET."""
         print(f'Fetching {url}')
-        return requests.get(url, headers={
+        response = requests.get(url.url.url, headers={
             'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64; rv:102.0) Gecko/20100101 Firefox/102.0',
         })
+        return Resource(
+            status=response.status_code,
+            headers=response.headers,
+            data=response.content)
 
 
 def split_list(text: str, sep: str) -> FrozenSet[str]:
+    """Split on sep, trimming whitespace and discarding empty entries."""
     result = []
     for s in text.split(sep):
         s = s.strip()
@@ -132,62 +209,39 @@ def split_list(text: str, sep: str) -> FrozenSet[str]:
     return frozenset(result)
 
 
-def normalize_url(url: Url) -> Url:
-    defaults = {'scheme': 'http', 'path': '/'}
-    return Url(**{
-        field: getattr(url, field) or defaults.get(field)
-        for field in url._fields
-    })
-
-
-def resolve_url(base: Url, rel: Url) -> Url:
-    if not rel.path:
-        path = base.path
-    elif rel.path.startswith('/'):
-        path = rel.path
-    else:
-        dirname = os.path.dirname(base.path)
-        path = os.path.join(dirname, rel.path)
-    result = Url(
-        scheme=rel.scheme or base.scheme,
-        host=rel.host or base.host,
-        path=path,
-        query=rel.query,
-        fragment=rel.fragment)
-    return normalize_url(result)
-
-
 def extract_links(base: Url, resource: Resource) -> FrozenSet[Url]:
+    """Examine a resource for links to follow."""
     content_type = split_list(resource.headers['Content-Type'], ';')
-    if 'text/html' not in content_type:
-        return []
     result = []
-    soup = bs4.BeautifulSoup(resource.data, 'html.parser')
-    for link in soup.find_all('a'):
-        rel = urllib3.util.parse_url(link.get('href'))
-        result.append(resolve_url(base, rel))
+    if 'text/html' in content_type:
+        soup = bs4.BeautifulSoup(resource.data, 'html.parser')
+        for link in soup.find_all('a'):
+            result.append(Url.relative(base, link.get('href')))
     return frozenset(result)
 
 
 @dataclasses.dataclass
 class ScrapePolicy:
+    """Heuristics for limiting the scope of the web scraper."""
     root: Url
 
     def should_scrape(self, url: Url) -> bool:
-        if url.host != self.root.host:
+        if url.uri.host != self.root.uri.host:
             return False
         if url.scheme not in ('http', 'https'):
             return False
         return True
-    
+
 
 def write_file(path: str, data: bytes):
+    """Store a file to the filesystem, ensuring the directory exists."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, 'wb') as f:
         f.write(data)
 
 
 def cmd_create(ns: argparse.Namespace):
+    """Create a new database file."""
     database = Database(ns.database)
     recreate: bool = ns.recreate
     testdata: bool = ns.testdata
@@ -195,40 +249,41 @@ def cmd_create(ns: argparse.Namespace):
     database.create(recreate=recreate)
     if testdata:
         database.insert(
-            urllib3.util.parse_url('example.com'),
+            Url.parse('example.com'),
             Resource(
                 status=200,
-                headers={'Content-Type': 'text/plain'},
+                headers=CaseInsensitiveDict({'Content-Type': 'text/plain'}),
                 data=b''))
 
 
 def cmd_scrape(ns: argparse.Namespace):
+    """Recursively fetch available HTTP resources."""
     database = Database(ns.database)
-    root = normalize_url(urllib3.util.parse_url(ns.root))
+    root = Url.parse(ns.root)
 
     database.create()
     cache = HTTPCache(database)
     policy = ScrapePolicy(root)
-    visited = set()
-    unvisited = set((root,))
+    visited: Set[Url] = set()
+    unvisited = {root}
 
     while unvisited:
-        next_unvisited = set()
-        for url in unvisited:
+        next_unvisited: Set[Url] = set()
+        for url in sorted(unvisited):
             resource = cache.fetch(url)
             for link in extract_links(root, resource):
                 if policy.should_scrape(link):
                     next_unvisited.add(link)
             visited.add(url)
-        unvisited = sorted(next_unvisited - visited)
+        unvisited = next_unvisited - visited
 
 
 def cmd_export(ns: argparse.Namespace):
+    """Export stored resources to the filesystem."""
     database = Database(ns.database)
     directory: str = ns.directory
 
-    for url in database.keys():
-        resource = database.get(url)
+    for url, resource in database.items():
         path = url.path
         if path.endswith('/'):
             ext = resource_extension(resource) or ''
@@ -246,21 +301,18 @@ def main(args: Sequence[str]):
     def cmd_help(_):
         parser.print_help()
 
-    p_help = subparsers.add_parser('help')
-    p_help.set_defaults(command=cmd_help)
-
-    p_create = subparsers.add_parser('create')
+    p_create = subparsers.add_parser('create', help=cmd_create.__doc__)
     p_create.set_defaults(command=cmd_create)
     p_create.add_argument('--recreate', action='store_true', default=False)
     p_create.add_argument('--testdata', action='store_true', default=False)
 
-    p_create = subparsers.add_parser('scrape')
+    p_create = subparsers.add_parser('scrape', help=cmd_scrape.__doc__)
     p_create.set_defaults(command=cmd_scrape)
     p_create.add_argument('root')
 
-    p_create = subparsers.add_parser('export')
+    p_create = subparsers.add_parser('export', help=cmd_export.__doc__)
     p_create.set_defaults(command=cmd_export)
-    p_create.add_argument('directory', default='output')
+    p_create.add_argument('directory')
 
     ns = parser.parse_args(args[1:])
     command = getattr(ns, 'command', cmd_help)

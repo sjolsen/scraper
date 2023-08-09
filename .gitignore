@@ -1,4 +1,4 @@
-scraper.db
+*.db
 settings.json
 *.pyc
 output/*
