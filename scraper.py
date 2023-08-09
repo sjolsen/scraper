@@ -49,7 +49,7 @@ class Url:
             path=self.uri.path,
             query=self.query,
             fragment=self.fragment)
-    
+
     def __str__(self) -> str:
         return str(self.url)
 
@@ -130,16 +130,20 @@ class Database:
             url_row = c.fetchone()
             if url_row is None:
                 return None
-            c.execute("""
-                SELECT name, value FROM header
-                WHERE url_id = ?
-            """, (url_row['id'],))
-            header_rows = c.fetchall()
-        return Resource(
-            status=url_row['status'],
-            headers=CaseInsensitiveDict(
-                {r['name']: r['value'] for r in header_rows}),
-            data=url_row['data'])
+            return Resource(
+                status=url_row['status'],
+                headers=self._get_headers(connection, url_row['id']),
+                data=url_row['data'])
+
+    def _get_headers(self, connection: sqlite3.Connection,
+                     url_id: int) -> CaseInsensitiveDict[str]:
+        """Get the headers for a resource with a fresh cursor."""
+        c = connection.cursor()
+        header_rows = c.execute("""
+            SELECT name, value FROM header
+            WHERE url_id = ?
+        """, (url_id,))
+        return CaseInsensitiveDict({r['name']: r['value'] for r in header_rows})
 
     def insert(self, url: Url, resource: Resource):
         """Insert a resource into the store."""
@@ -157,20 +161,18 @@ class Database:
                     VALUES(?, ?, ?)
                 """, (url_id, name, value))
 
-    def keys(self) -> List[Uri]:
-        """List stored resources (Uri only)."""
+    def items(self) -> Iterator[Tuple[Uri, Resource]]:
+        """List stored resources (Uri and Resource)."""
         with sqlite3.connect(self.path) as connection:
             connection.row_factory = sqlite3.Row
             c = connection.cursor()
-            c.execute('SELECT host, path FROM url')
-            return [Uri(host=r['host'], path=r['path']) for r in c.fetchall()]
-
-    def items(self) -> Iterator[Tuple[Uri, Resource]]:
-        """List stored resources (Uri and Resource)."""
-        for uri in self.keys():
-            resource = self.get(uri)
-            assert resource is not None
-            yield uri, resource
+            for url_row in c.execute('SELECT * FROM url'):
+                uri = Uri(host=url_row['host'], path=url_row['path'])
+                resource = Resource(
+                    status=url_row['status'],
+                    headers=self._get_headers(connection, url_row['id']),
+                    data=url_row['data'])
+                yield uri, resource
 
 
 @dataclasses.dataclass
