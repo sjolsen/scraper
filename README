@@ -1,0 +1,8 @@
+This is a web scraper I've written to download the content hosted at
+https://tomlehrersongs.com/. The scraper uses sqlite to cache HTTP requests. The
+usage is:
+
+  $ python3 scraper.py scrape https://tomlehrersongs.com/
+  $ python3 scraper.py export
+
+It's messy but it works.

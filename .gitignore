@@ -1,0 +1,4 @@
+scraper.db
+settings.json
+*.pyc
+output/*
