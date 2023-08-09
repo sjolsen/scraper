@@ -145,14 +145,14 @@ class Database:
         """, (url_id,))
         return CaseInsensitiveDict({r['name']: r['value'] for r in header_rows})
 
-    def insert(self, url: Url, resource: Resource):
+    def insert(self, uri: Uri, resource: Resource):
         """Insert a resource into the store."""
         with sqlite3.connect(self.path) as connection:
             c = connection.cursor()
             c.execute("""
                 INSERT INTO url(host, path, status, data)
                 VALUES(?, ?, ?, ?)
-            """, (url.uri.host, url.uri.path, resource.status,
+            """, (uri.host, uri.path, resource.status,
                   resource.data))
             url_id = c.lastrowid
             for name, value in resource.headers.items():
@@ -186,7 +186,7 @@ class HTTPCache:
         if hit is not None:
             return hit
         resource = self.fetch_uncached(url)
-        self.database.insert(url, resource)
+        self.database.insert(url.uri, resource)
         return resource
 
     def fetch_uncached(self, url: Url) -> Resource:
@@ -251,7 +251,7 @@ def cmd_create(ns: argparse.Namespace):
     database.create(recreate=recreate)
     if testdata:
         database.insert(
-            Url.parse('example.com'),
+            Url.parse('example.com').uri,
             Resource(
                 status=200,
                 headers=CaseInsensitiveDict({'Content-Type': 'text/plain'}),
